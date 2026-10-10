@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.aftereffects.agentbridge" ExtensionBundleVersion="0.1.0" ExtensionBundleName="After Effects Agent Bridge" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList><Extension Id="com.aftereffects.agentbridge.panel" Version="0.1.0" /></ExtensionList>
+  <ExecutionEnvironment>
+    <HostList><Host Name="AEFT" Version="[22.0,99.9]" /></HostList>
+    <LocaleList><Locale Code="All" /></LocaleList>
+    <RequiredRuntimeList><RequiredRuntime Name="CSXS" Version="9.0" /></RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList><Extension Id="com.aftereffects.agentbridge.panel"><DispatchInfo>
+    <Resources><MainPath>./index.html</MainPath><ScriptPath>./host.jsx</ScriptPath></Resources>
+    <Lifecycle><AutoVisible>false</AutoVisible></Lifecycle>
+    <UI><Type>Panel</Type><Menu>Agent Bridge</Menu><Geometry><Size><Width>320</Width><Height>420</Height></Size><MinSize><Width>260</Width><Height>260</Height></MinSize></Geometry></UI>
+  </DispatchInfo></Extension></DispatchInfoList>
+</ExtensionManifest>

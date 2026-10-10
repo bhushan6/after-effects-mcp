@@ -1,0 +1,11 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>AE Agent Bridge</title><style>
+body{font:13px Arial,sans-serif;background:#242424;color:#eee;margin:14px}h1{font-size:16px}label{display:block;margin:10px 0 4px}input{box-sizing:border-box;width:100%;background:#151515;border:1px solid #777;border-radius:3px;color:#fff;padding:6px}button{background:#467acc;border:0;color:white;padding:7px 12px;margin-top:12px;cursor:pointer}button:disabled{opacity:.5}#status{padding:10px;background:#333;margin-top:12px}#details{white-space:pre-wrap;font-size:11px;color:#bbb;overflow-wrap:anywhere}small{color:#aaa}
+</style></head><body>
+<h1>After Effects Agent Bridge</h1><small>Run <code>npm run cli -- panel-config</code> in the project, then enter the local port and secret.</small>
+<label for="port">Local port</label><input id="port" type="number" min="1" max="65535">
+<label for="secret">Pairing secret</label><input id="secret" type="password" autocomplete="off">
+<label><input id="allow-edits" type="checkbox" style="width:auto"> Allow edits in the current project</label>
+<button id="connect">Connect</button> <button id="disconnect" disabled>Disconnect</button>
+<div id="status">Disconnected</div><div id="details"></div>
+<script src="panel.js"></script></body></html>

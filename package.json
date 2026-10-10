@@ -1,0 +1,13 @@
+{
+  "name": "after-effects-agent-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "daemon": "node apps/bridge/main.js",
+    "mcp": "node apps/mcp/main.js",
+    "cli": "node apps/cli/main.js"
+  }
+}
