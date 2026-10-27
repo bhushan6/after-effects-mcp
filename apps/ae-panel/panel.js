@@ -1,5 +1,5 @@
 (function () {
-  var socket = null, session = null, reconnectTimer = null;
+  var socket = null, session = null, reconnectTimer = null, retries = 0;
   var portInput = document.getElementById('port'), secretInput = document.getElementById('secret');
   var status = document.getElementById('status'), details = document.getElementById('details');
   portInput.value = localStorage.getItem('aeBridgePort') || '';
@@ -14,29 +14,50 @@
       catch (e) { callback({ ok:false, error:{ code:'AE_UNRESPONSIVE', message:'Host returned no valid response: ' + String(raw).slice(0,120) } }); }
     });
   }
-  function connect() {
-    var port = Number(portInput.value), secret = secretInput.value.trim();
+  // Re-evaluate host.jsx from disk so an updated install takes effect on every (re)connect without reloading the panel.
+  function reloadHost(callback) {
+    var root = decodeURI(window.__adobe_cep__.getSystemPath('extension')).replace(/^file:\/\//, '');
+    window.__adobe_cep__.evalScript('$.evalFile(' + JSON.stringify(root + '/host.jsx') + ')', function () { callback(); });
+  }
+  function cancelReconnect() { if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = null; }
+  // Retry with exponential backoff (1s doubling to 30s) while the bridge service restarts; settings come from storage.
+  function scheduleReconnect(reason) {
+    cancelReconnect();
+    var delay = Math.min(30000, 1000 * Math.pow(2, Math.min(retries, 5)));
+    retries++;
+    show('Reconnecting in ' + Math.round(delay / 1000) + 's…', reason + '\nAttempt ' + retries + '. Press Disconnect to stop.');
+    document.getElementById('disconnect').disabled = false;
+    reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(true); }, delay);
+  }
+  function connect(auto) {
+    cancelReconnect();
+    if (!auto) {
+      retries = 0;
+      localStorage.setItem('aeBridgePort', String(Number(portInput.value)));
+      localStorage.setItem('aeBridgeSecret', secretInput.value.trim());
+      localStorage.setItem('aeBridgeAllowEdits', String(document.getElementById('allow-edits').checked));
+    }
+    var port = Number(localStorage.getItem('aeBridgePort')), secret = localStorage.getItem('aeBridgeSecret') || '';
+    var allowEdits = localStorage.getItem('aeBridgeAllowEdits') === 'true';
     if (!port || !secret) return show('Enter port and secret');
-    localStorage.setItem('aeBridgePort', String(port)); localStorage.setItem('aeBridgeSecret', secret);
-    var allowEdits = document.getElementById('allow-edits').checked;
-    localStorage.setItem('aeBridgeAllowEdits', String(allowEdits));
-    if (socket) socket.close();
-    show('Connecting to local service…');
-    var current = new WebSocket('ws://127.0.0.1:' + port + '/panel');
+    localStorage.setItem('aeBridgeAutoConnect', 'true');
+    if (socket) { var old = socket; socket = null; old.close(); }
+    show(auto ? 'Reconnecting to local service…' : 'Connecting to local service…');
+    var current = new WebSocket('ws://127.0.0.1:' + port + '/panel'), welcomed = false;
     socket = current;
     current.onopen = function () {
-      host('hello', {}, function (result) {
+      reloadHost(function () { host('hello', {}, function (result) {
         if (current !== socket) return;
         if (!result.ok) { show('AE scripting unavailable', result.error.message); current.close(); return; }
         current.send(JSON.stringify({ type:'hello', secret:secret, protocolVersion:1, adapterVersion:'0.1.0-cep', aeVersion:result.value.aeVersion, os:navigator.platform, scope:allowEdits ? 'edit' : 'read', sessionNonce:String(Date.now()) + '-' + Math.random() }));
-      });
+      }); });
     };
     current.onmessage = function (event) {
       if (current !== socket) return;
       var message;
       try { message = JSON.parse(event.data); } catch (_) { return; }
       if (message.type === 'welcome') {
-        session = message.projectSessionId;
+        session = message.projectSessionId; welcomed = true; retries = 0;
         document.getElementById('disconnect').disabled = false;
         host('inspect', { id:'panel-context-' + Date.now(), params:{} }, function (result) {
           if (current !== socket) return;
@@ -53,9 +74,22 @@
         });
       }
     };
-    current.onerror = function () { if (current === socket) show('Connection error', 'Check the port and bridge service'); };
-    current.onclose = function () { if (current !== socket) return; session = null; document.getElementById('disconnect').disabled = true; show('Disconnected'); };
+    current.onerror = function () {};
+    current.onclose = function (event) {
+      if (current !== socket) return;
+      socket = null; session = null;
+      // 1008: the service rejected the secret; 1001: another panel took over. Retrying would not help in either case.
+      if (event.code === 1008) { document.getElementById('disconnect').disabled = true; return show('Pairing rejected', 'Run npm run cli -- panel-config and check the port and secret'); }
+      if (event.code === 1001) { document.getElementById('disconnect').disabled = true; return show('Disconnected', 'Another panel connected to the bridge'); }
+      scheduleReconnect(welcomed ? 'Bridge service closed the connection' : 'Bridge service not reachable on port ' + port);
+    };
   }
-  document.getElementById('connect').onclick = connect;
-  document.getElementById('disconnect').onclick = function () { if (socket) socket.close(); socket = null; session = null; this.disabled = true; show('Disconnected'); };
+  document.getElementById('connect').onclick = function () { connect(false); };
+  document.getElementById('disconnect').onclick = function () {
+    cancelReconnect(); localStorage.setItem('aeBridgeAutoConnect', 'false');
+    var old = socket; socket = null; session = null; if (old) old.close();
+    this.disabled = true; show('Disconnected');
+  };
+  // Reopening the panel (or AE) resumes a connection the user did not end with Disconnect.
+  if (localStorage.getItem('aeBridgeAutoConnect') === 'true' && portInput.value && secretInput.value) connect(true);
 }());

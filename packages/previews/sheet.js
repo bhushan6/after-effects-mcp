@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { join } from 'node:path';
 import { BridgeError } from '../protocol/index.js';
 export async function resizePng(source, output, longEdge) {
   await new Promise((resolve, reject) => {
@@ -17,6 +18,17 @@ export async function cropPng(source, output, crop, maxLongEdge) {
     child.stderr.on('data',d=>{error=(error+d).slice(-2000);});
     child.on('error',e=>reject(new BridgeError('UNSUPPORTED_CAPABILITY',`FFmpeg unavailable: ${e.message}`)));
     child.on('close',code=>code===0?resolve():reject(new BridgeError('RENDER_FAILED',`Crop failed: ${error.slice(-500)}`)));
+  });
+}
+// Encodes f00000.png, f00001.png… in dir as H.264; yuv420p needs even dimensions.
+export async function encodeVideo(dir, output, fps, maxLongEdge) {
+  const scale=maxLongEdge ? `scale=${maxLongEdge}:${maxLongEdge}:force_original_aspect_ratio=decrease:force_divisible_by=2` : 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+  await new Promise((resolve,reject) => {
+    const child=spawn('ffmpeg',['-v','error','-y','-framerate',String(fps),'-i',join(dir,'f%05d.png'),'-vf',scale,'-c:v','libx264','-preset','slow','-crf','16','-pix_fmt','yuv420p','-movflags','+faststart',output],{stdio:['ignore','ignore','pipe']});
+    let error='';
+    child.stderr.on('data',d=>{error=(error+d).slice(-2000);});
+    child.on('error',e=>reject(new BridgeError('UNSUPPORTED_CAPABILITY',`FFmpeg unavailable: ${e.message}`)));
+    child.on('close',code=>code===0?resolve():reject(new BridgeError('RENDER_FAILED',`Video encode failed: ${error.slice(-500)}`)));
   });
 }
 export async function assembleSheet(entries, output, width, height, frameDuration) {

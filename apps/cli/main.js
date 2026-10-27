@@ -43,7 +43,15 @@ try {
   } else if (command === 'frame') {
     const [projectSessionId, compRef, frame] = args;
     console.log(JSON.stringify(await callBridge('ae_render_frame', { projectSessionId, compRef, frame:Number(frame) }), null, 2));
+  } else if (command === 'sheet') {
+    const [projectSessionId, compRef, startFrame, endFrameExclusive, count = '8'] = args;
+    console.log(JSON.stringify(await callBridge('ae_render_contact_sheet', { projectSessionId, compRef, startFrame:Number(startFrame), endFrameExclusive:Number(endFrameExclusive), count:Number(count) }), null, 2));
+  } else if (command === 'video') {
+    const [projectSessionId, compRef, startFrame, endFrameExclusive, outputPath] = args;
+    console.log(JSON.stringify(await callBridge('ae_render_video', { projectSessionId, compRef, startFrame:Number(startFrame), endFrameExclusive:Number(endFrameExclusive), ...(outputPath && { outputPath }) }), null, 2));
+  } else if (command === 'job') {
+    console.log(JSON.stringify(await callBridge('ae_job', { id:args[0] }), null, 2));
   } else {
-    console.log('Commands: doctor, install-panel, uninstall-panel, panel-config, context, inspect, catalog, apply FILE, frame SESSION COMP FRAME');
+    console.log('Commands: doctor, install-panel, uninstall-panel, panel-config, context, inspect, catalog, apply FILE, frame SESSION COMP FRAME, sheet SESSION COMP START END [COUNT], video SESSION COMP START END [OUT.mp4], job ID');
   }
 } catch (e) { console.error(`${e.code || 'ERROR'}: ${e.message}`); process.exitCode = 1; }

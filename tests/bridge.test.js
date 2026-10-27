@@ -84,3 +84,48 @@ test('contact sheet returns mapped native frame artifacts', { skip:spawnSync('ff
   assert.ok(existsSync(detail.path));
   assert.deepEqual(detail.metadata.crop,{x:40,y:30,width:100,height:80});
 });
+const ffmpegMissing=spawnSync('ffmpeg',['-version']).status !== 0;
+// Mock panel whose active comp starts elsewhere and follows openComp, rendering a solid PNG for each frame.
+function viewerFixture(t, onRender=()=>{}) {
+  let active='comp_9', source;
+  const f=fixture(t,(msg,peer) => {
+    const reply=value => peer.emit('message',{ type:'result', id:msg.id, ok:true, value });
+    if (msg.method === 'inspect') { const x=inspect(); x.activeComp.ref=active; x.activeComp.duration=1; reply(x); }
+    if (msg.method === 'openComp') { active=msg.params.compRef; reply({ ref:active, active:true }); }
+    if (msg.method === 'renderFrame') {
+      if (active !== msg.params.compRef) return peer.emit('message',{ type:'result', id:msg.id, ok:false, error:{ code:'WRONG_PROJECT', message:'not active' } });
+      onRender(msg.params); copyFileSync(source,msg.params.outputPath);
+      reply({ supported:true, effectiveFrame:msg.params.frame, effectiveSeconds:msg.params.frame/30, width:320, height:180 });
+    }
+  });
+  source=join(f.root,'source.png');
+  const generated=spawnSync('ffmpeg',['-f','lavfi','-i','color=c=blue:s=320x180:d=0.1','-frames:v','1','-y',source],{ encoding:'utf8' });
+  assert.equal(generated.status,0,generated.stderr.slice(-500));
+  return f;
+}
+test('frame render opens the target comp and accepts a token taken before the switch', { skip:ffmpegMissing }, async t => {
+  const { bridge, sessionId }=viewerFixture(t);
+  const ctx=await bridge.rpc('ae_context');
+  assert.equal(ctx.activeComp.ref,'comp_9');
+  const result=await bridge.rpc('ae_render_frame',{ projectSessionId:sessionId, compRef:'comp_7', frame:3, expectedInspectionToken:ctx.inspectionToken });
+  assert.equal(result.consistent,true);
+  assert.equal((await bridge.rpc('ae_context')).activeComp.ref,'comp_7');
+});
+test('video render runs as a polled job and encodes an MP4', { skip:ffmpegMissing }, async t => {
+  const rendered=[];
+  const { bridge, sessionId, root }=viewerFixture(t,p=>rendered.push(p.frame));
+  const out=join(root,'out','clip.mp4');
+  const started=await bridge.rpc('ae_render_video',{ projectSessionId:sessionId, compRef:'comp_7', startFrame:5, endFrameExclusive:17, outputPath:out });
+  assert.equal(started.frames,12);
+  let job;
+  for (let i=0; i<300; i++) { job=await bridge.rpc('ae_job',{ id:started.jobId }); if (job.state === 'succeeded' || job.state === 'failed') break; await new Promise(r=>setTimeout(r,50)); }
+  assert.equal(job.state,'succeeded',JSON.stringify(job.error));
+  assert.deepEqual(rendered,[5,6,7,8,9,10,11,12,13,14,15,16]);
+  assert.equal(job.result.path,out); assert.equal(job.result.fps,30);
+  const decoded=spawnSync('ffmpeg',['-i',out,'-map','0:v','-f','null','-'],{ encoding:'utf8' }).stderr;
+  assert.match(decoded,/320x180/); assert.match(decoded,/frame=\s*12 /);
+  assert.ok(!existsSync(join(bridge.paths.artifacts,`${started.jobId}-frames`)));
+  const failed=await bridge.rpc('ae_render_video',{ projectSessionId:sessionId, compRef:'comp_7', startFrame:0, endFrameExclusive:40 });
+  for (let i=0; i<100; i++) { job=await bridge.rpc('ae_job',{ id:failed.jobId }); if (job.state === 'failed' || job.state === 'succeeded') break; await new Promise(r=>setTimeout(r,20)); }
+  assert.equal(job.state,'failed'); assert.match(job.error.message,/past the end/);
+});

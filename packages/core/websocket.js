@@ -14,7 +14,7 @@ export class WebSocketPeer extends EventEmitter {
     while (this.buffer.length >= 2) {
       const b0 = this.buffer[0], b1 = this.buffer[1];
       let len = b1 & 127, header = 2;
-      if ((b0 & 0x70) || !(b1 & 128) || !(b0 & 0x80)) return this.close(1002);
+      if ((b0 & 0x70) || !(b1 & 128)) return this.close(1002);
       if (len === 126) { if (this.buffer.length < 4) return; len = this.buffer.readUInt16BE(2); header = 4; }
       if (len === 127) { if (this.buffer.length < 10) return; const high = this.buffer.readUInt32BE(2); if (high) return this.close(1009); len = this.buffer.readUInt32BE(6); header = 10; }
       if (len > MAX_MESSAGE) return this.close(1009);
@@ -23,11 +23,26 @@ export class WebSocketPeer extends EventEmitter {
       const payload = Buffer.from(this.buffer.subarray(header + 4, header + 4 + len));
       for (let i = 0; i < len; i++) payload[i] ^= mask[i % 4];
       this.buffer = this.buffer.subarray(header + 4 + len);
-      const opcode = b0 & 15;
+      const opcode = b0 & 15, fin = !!(b0 & 0x80);
+      if (opcode >= 8 && (!fin || len > 125)) return this.close(1002);
       if (opcode === 8) return this.close(1000);
       if (opcode === 9) { this.sendFrame(10, payload); continue; }
-      if (opcode !== 1) return this.close(1003);
-      try { this.emit('message', JSON.parse(payload.toString('utf8'))); }
+      if (opcode === 10) continue;
+      // Chromium (and so CEP panels) may split a large message into a text frame plus continuation frames.
+      let message;
+      if (opcode === 1) {
+        if (this.fragments) return this.close(1002);
+        if (fin) message = payload;
+        else { this.fragments = [payload]; this.fragmentBytes = len; continue; }
+      } else if (opcode === 0) {
+        if (!this.fragments) return this.close(1002);
+        this.fragmentBytes += len;
+        if (this.fragmentBytes > MAX_MESSAGE) return this.close(1009);
+        this.fragments.push(payload);
+        if (!fin) continue;
+        message = Buffer.concat(this.fragments); this.fragments = null;
+      } else return this.close(1003);
+      try { this.emit('message', JSON.parse(message.toString('utf8'))); }
       catch { this.close(1007); return; }
     }
   }

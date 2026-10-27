@@ -1,10 +1,20 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { BridgeError, catalog, normalizeError, validateBatch, validateFrame, PROTOCOL_VERSION } from '../protocol/index.js';
+import { existsSync, mkdirSync, statSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { BridgeError, catalog, normalizeError, validateBatch, validateFrame, validateVideo, PROTOCOL_VERSION } from '../protocol/index.js';
 import { sampleFrames } from '../previews/sampling.js';
-import { assembleSheet, resizePng, cropPng } from '../previews/sheet.js';
+import { assembleSheet, resizePng, cropPng, encodeVideo } from '../previews/sheet.js';
 import { Storage } from './storage.js';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// AE 26's saveFrameToPng returns before the file is written; wait for a complete PNG (ends with its IEND chunk).
+export async function waitForPng(path, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (existsSync(path) && statSync(path).size >= 16 && readFileSync(path).subarray(-8, -4).toString('latin1') === 'IEND') return true;
+    await sleep(100);
+  } while (Date.now() < deadline);
+  return false;
+}
 
 export class Bridge {
   constructor(paths, secret) {
@@ -110,20 +120,31 @@ export class Bridge {
       } finally { this.currentJobId = null; }
     });
   }
+  // Open the target comp in the viewer before baselining. A caller token taken while another item was active still
+  // matches, since the only change is this viewer switch.
+  async focusComp({ projectSessionId, compRef, expectedInspectionToken }) {
+    this.requirePanel(projectSessionId);
+    let before = await this.inspectRaw();
+    if (expectedInspectionToken && expectedInspectionToken !== this.token(before)) throw new BridgeError('STATE_CONFLICT', 'Inspected state changed before rendering');
+    if (before.activeComp?.ref !== compRef) {
+      await this.command('openComp', { projectSessionId, compRef });
+      before = await this.inspectRaw();
+      if (before.activeComp?.ref !== compRef) throw new BridgeError('WRONG_PROJECT', 'Could not open the target composition in the viewer');
+    }
+    return before;
+  }
   async renderFrame(input) {
     const params = validateFrame(input);
     return this.enqueue(() => this.renderFrameInLane(params));
   }
   async renderFrameInLane(params) {
-    this.requirePanel(params.projectSessionId);
-    const before = await this.inspectRaw();
+    const before = await this.focusComp(params);
     const token = this.token(before);
-    if (params.expectedInspectionToken && params.expectedInspectionToken !== token) throw new BridgeError('STATE_CONFLICT', 'Inspected state changed before rendering');
     const id = `artifact_${randomUUID()}`;
     const originalPath = join(this.paths.artifacts, `${id}-original.png`);
     const host = await this.command('renderFrame', { ...params, outputPath:originalPath }, { timeout:60000 });
     if (!host?.supported) throw new BridgeError('UNSUPPORTED_CAPABILITY', host?.reason || 'Native live-frame render is unavailable on this AE build');
-    if (!existsSync(originalPath) || statSync(originalPath).size < 16) throw new BridgeError('RENDER_FAILED', 'AE reported success but produced no PNG');
+    if (!await waitForPng(originalPath)) throw new BridgeError('RENDER_FAILED', 'AE reported success but produced no complete PNG within 15s');
     let path=originalPath, viewingLongEdge=Math.max(host.width,host.height);
     if (viewingLongEdge > params.maxLongEdge) {
       path=join(this.paths.artifacts, `${id}.png`);
@@ -150,8 +171,7 @@ export class Bridge {
     const frames = sampleFrames(input);
     this.requirePanel(input.projectSessionId);
     return this.enqueue(async () => {
-      const before = await this.inspectRaw(); const token = this.token(before);
-      if (input.expectedInspectionToken && input.expectedInspectionToken !== token) throw new BridgeError('STATE_CONFLICT', 'Inspected state changed before rendering');
+      const before = await this.focusComp(input); const token = this.token(before);
       const entries = [], errors = [];
       for (const frame of frames) {
         try {
@@ -163,7 +183,6 @@ export class Bridge {
       if (!entries.length) throw new BridgeError('RENDER_FAILED', 'No frames rendered', { errors });
       const id = `artifact_${randomUUID()}`; const path = join(this.paths.artifacts, `${id}.png`);
       const comp = before.activeComp;
-      if (!comp || comp.ref !== input.compRef) throw new BridgeError('WRONG_PROJECT', 'Contact sheet comp is not active');
       const layout = await assembleSheet(entries, path, comp.width, comp.height, comp.frameDuration);
       const after = await this.inspectRaw();
       const consistent = token === this.token(after) && errors.every(x => x.error.code !== 'STATE_CONFLICT');
@@ -171,6 +190,45 @@ export class Bridge {
       this.storage.addArtifact(id, 'contact_sheet', path, metadata);
       return { artifactId:id, ...metadata, path };
     });
+  }
+  // Frames can take minutes, longer than an RPC call may wait, so this returns a job to poll with ae_job.
+  renderVideo(input) {
+    const params = validateVideo(input);
+    this.requirePanel(params.projectSessionId);
+    const id = `render_${randomUUID()}`;
+    this.storage.createJob(id, 'render_video', params);
+    this.storage.updateJob(id, 'queued');
+    this.enqueue(() => this.renderVideoInLane(id, params));
+    return { jobId:id, state:'queued', frames:params.endFrameExclusive - params.startFrame, next:'Poll ae_job with jobId until state is succeeded or failed' };
+  }
+  async renderVideoInLane(jobId, params) {
+    const dir = join(this.paths.artifacts, `${jobId}-frames`);
+    try {
+      this.currentJobId = jobId;
+      const before = await this.focusComp(params), token = this.token(before), comp = before.activeComp;
+      if (params.endFrameExclusive * comp.frameDuration > comp.duration + comp.frameDuration / 2) throw new BridgeError('INVALID_ARGUMENT', 'endFrameExclusive is past the end of the composition');
+      const total = params.endFrameExclusive - params.startFrame;
+      mkdirSync(dir, { recursive:true, mode:0o700 });
+      this.storage.updateJob(jobId, 'executing', { progress:{ done:0, total } });
+      for (let i = 0; i < total; i++) {
+        const frame = params.startFrame + i, outputPath = join(dir, `f${String(i).padStart(5, '0')}.png`);
+        const host = await this.command('renderFrame', { projectSessionId:params.projectSessionId, compRef:params.compRef, frame, outputPath }, { timeout:60000 });
+        if (!host?.supported) throw new BridgeError('UNSUPPORTED_CAPABILITY', host?.reason || 'Native live-frame render is unavailable on this AE build');
+        if (!await waitForPng(outputPath)) throw new BridgeError('RENDER_FAILED', `AE produced no complete PNG for frame ${frame} within 15s`);
+        if ((i + 1) % 10 === 0) this.storage.updateJob(jobId, 'executing', { progress:{ done:i + 1, total } });
+      }
+      const fps = Math.round(1000 / comp.frameDuration) / 1000;
+      const path = params.outputPath || join(this.paths.artifacts, `${jobId}.mp4`);
+      mkdirSync(dirname(path), { recursive:true });
+      await encodeVideo(dir, path, fps, params.maxLongEdge);
+      const consistent = token === this.token(await this.inspectRaw());
+      const artifactId = `artifact_${randomUUID()}`;
+      const metadata = { projectSessionId:params.projectSessionId, compRef:params.compRef, startFrame:params.startFrame, endFrameExclusive:params.endFrameExclusive, frames:total, fps, seconds:total / fps, sourceInspectionToken:token, consistent };
+      this.storage.addArtifact(artifactId, 'video', path, metadata);
+      return this.storage.updateJob(jobId, 'succeeded', { artifactId, path, ...metadata });
+    } catch (e) {
+      return this.storage.updateJob(jobId, 'failed', normalizeError(e));
+    } finally { this.currentJobId = null; rmSync(dir, { recursive:true, force:true }); }
   }
   async artifact(params) {
     const source=this.storage.artifact(params.id);
@@ -195,6 +253,7 @@ export class Bridge {
       case 'ae_apply': return this.apply(params.batch, params.preflightOnly);
       case 'ae_render_frame': return this.renderFrame(params);
       case 'ae_render_contact_sheet': return this.renderContactSheet(params);
+      case 'ae_render_video': return this.renderVideo(params);
       case 'ae_job': return this.storage.job(params.id) || (() => { throw new BridgeError('NOT_FOUND','Job not found'); })();
       case 'ae_artifact': return this.artifact(params);
       case 'ae_recent_artifacts': return this.storage.recentArtifacts();
